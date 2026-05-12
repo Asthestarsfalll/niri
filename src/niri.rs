@@ -16,8 +16,8 @@ use calloop::futures::Scheduler;
 use niri_config::debug::PreviewRender;
 use niri_config::output::MaxBpc;
 use niri_config::{
-    Config, FloatOrInt, Key, Modifiers, OutputName, TrackLayout, WarpMouseToFocusMode,
-    WorkspaceReference, Xkb,
+    Config, FloatOrInt, HotCornerAction, Key, Modifiers, OutputName, TrackLayout,
+    WarpMouseToFocusMode, WorkspaceReference, Xkb,
 };
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::Keycode;
@@ -1211,7 +1211,9 @@ impl State {
             let focus_on_layer =
                 |layer| excl_focus_on_layer(layer).or_else(|| on_d_focus_on_layer(layer));
 
-            let is_overview_open = self.niri.layout.is_overview_open();
+            let is_overview_open = self.niri.layout.is_overview_open()
+                || self.niri.layout.is_workspace_overview_open()
+                || self.niri.layout.is_window_overview_open();
 
             let mut surface = grab_on_layer(Layer::Overlay);
             // FIXME: we shouldn't prioritize the top layer grabs over regular overlay input or a
@@ -3089,25 +3091,82 @@ impl Niri {
             Rectangle::new(corner, Size::new(1., 1.)).contains(pos)
         };
 
-        if hot_corners.top_right && contains(Point::new(size.w - 1., 0.)) {
+        if hot_corners.top_right.is_some() && contains(Point::new(size.w - 1., 0.)) {
             return true;
         }
-        if hot_corners.bottom_left && contains(Point::new(0., size.h - 1.)) {
+        if hot_corners.bottom_left.is_some() && contains(Point::new(0., size.h - 1.)) {
             return true;
         }
-        if hot_corners.bottom_right && contains(Point::new(size.w - 1., size.h - 1.)) {
+        if hot_corners.bottom_right.is_some() && contains(Point::new(size.w - 1., size.h - 1.)) {
             return true;
         }
 
         // If the user didn't explicitly set any corners, we default to top-left.
-        if (hot_corners.top_left
-            || !(hot_corners.top_right || hot_corners.bottom_right || hot_corners.bottom_left))
+        if (hot_corners.top_left.is_some()
+            || !(hot_corners.top_right.is_some()
+                || hot_corners.bottom_right.is_some()
+                || hot_corners.bottom_left.is_some()))
             && contains(Point::new(0., 0.))
         {
             return true;
         }
 
         false
+    }
+
+    pub fn hot_corner_action_at(&self, pos: Point<f64, Logical>) -> Option<HotCornerAction> {
+        let (output, pos_within_output) = self.output_under(pos)?;
+
+        let config = self.config.borrow();
+        let hot_corners = output
+            .user_data()
+            .get::<OutputName>()
+            .and_then(|name| config.outputs.find(name))
+            .and_then(|c| c.hot_corners)
+            .unwrap_or(config.gestures.hot_corners);
+
+        if hot_corners.off {
+            return None;
+        }
+
+        let geom = self.global_space.output_geometry(output).unwrap();
+        let size = geom.size.to_f64();
+
+        let contains = |corner: Point<f64, Logical>| {
+            Rectangle::new(corner, Size::new(1., 1.)).contains(pos_within_output)
+        };
+
+        if let Some(entry) = hot_corners.top_right {
+            if contains(Point::new(size.w - 1., 0.)) {
+                return Some(entry.action);
+            }
+        }
+        if let Some(entry) = hot_corners.bottom_left {
+            if contains(Point::new(0., size.h - 1.)) {
+                return Some(entry.action);
+            }
+        }
+        if let Some(entry) = hot_corners.bottom_right {
+            if contains(Point::new(size.w - 1., size.h - 1.)) {
+                return Some(entry.action);
+            }
+        }
+
+        if (hot_corners.top_left.is_some()
+            || !(hot_corners.top_right.is_some()
+                || hot_corners.bottom_right.is_some()
+                || hot_corners.bottom_left.is_some()))
+            && contains(Point::new(0., 0.))
+        {
+            return Some(
+                hot_corners
+                    .top_left
+                    .map(|e| e.action)
+                    .unwrap_or(HotCornerAction::Overview),
+            );
+        }
+
+        None
     }
 
     pub fn is_sticky_obscured_under(
@@ -3169,7 +3228,7 @@ impl Niri {
         output: &Output,
         pos_within_output: Point<f64, Logical>,
     ) -> bool {
-        if self.layout.is_overview_open() {
+        if self.layout.is_any_overview_open() {
             return false;
         }
 
@@ -3415,7 +3474,7 @@ impl Niri {
         let mut under =
             layer_popup_under(Layer::Overlay).or_else(|| layer_toplevel_under(Layer::Overlay));
 
-        let is_overview_open = self.layout.is_overview_open();
+        let is_overview_open = self.layout.is_any_overview_open();
 
         // When rendering above the top layer, we put the regular monitor elements first.
         // Otherwise, we will render all layer-shell pop-ups and the top layer on top.
@@ -4400,42 +4459,50 @@ impl Niri {
 
             mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| push(elem.into()));
 
-            // Macro instead of closure to avoid borrowing push().
-            macro_rules! process {
-                ($geo:expr) => {{
-                    &mut |elem| {
-                        if let Some(elem) = scale_relocate_crop(elem, output_scale, zoom, $geo) {
-                            push(elem.into());
+            if mon.window_overview_open || mon.is_window_overview_animating() {
+                mon.render_window_overview(ctx.r(), &mut |elem| push(elem.into()));
+            } else if mon.workspace_overview_open || mon.is_workspace_overview_animating() {
+                // Render workspace overview instead of normal workspaces.
+                mon.render_workspace_overview(ctx.r(), &mut |elem| push(elem.into()));
+            } else {
+                // Macro instead of closure to avoid borrowing push().
+                macro_rules! process {
+                    ($geo:expr) => {{
+                        &mut |elem| {
+                            if let Some(elem) = scale_relocate_crop(elem, output_scale, zoom, $geo)
+                            {
+                                push(elem.into());
+                            }
                         }
-                    }
-                }};
-            }
+                    }};
+                }
 
-            for (ws, geo) in mon.workspaces_with_render_geo() {
-                let ns = Some(ws.id().get() as usize);
-                let xray_pos = XrayPos::new(geo.loc, zoom);
-                push_popups_from_layer!(Layer::Bottom, ns, xray_pos, process!(geo));
-                push_popups_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
-            }
+                for (ws, geo) in mon.workspaces_with_render_geo() {
+                    let ns = Some(ws.id().get() as usize);
+                    let xray_pos = XrayPos::new(geo.loc, zoom);
+                    push_popups_from_layer!(Layer::Bottom, ns, xray_pos, process!(geo));
+                    push_popups_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
+                }
 
-            mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| push(elem.into()));
+                mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| push(elem.into()));
 
-            for (ws, geo) in mon.workspaces_with_render_geo() {
-                // The render element namespace. This will be set to the workspace index for
-                // elements duplicated across workspaces (i.e. background and bottom layers) in
-                // order to have their non-xray framebuffer effects separated from each other.
-                //
-                // This doesn't have to correspond exactly to workspace id or idx, the only
-                // requirement is that there's only one framebuffer effect element with a given id +
-                // namespace on the frame at once. Id + namespace is used as the cache key in the
-                // damage tracker.
-                let ns = Some(ws.id().get() as usize);
-                let xray_pos = XrayPos::new(geo.loc, zoom);
-                push_normal_from_layer!(Layer::Bottom, ns, xray_pos, process!(geo));
-                push_normal_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
+                for (ws, geo) in mon.workspaces_with_render_geo() {
+                    // The render element namespace. This will be set to the workspace index for
+                    // elements duplicated across workspaces (i.e. background and bottom layers) in
+                    // order to have their non-xray framebuffer effects separated from each other.
+                    //
+                    // This doesn't have to correspond exactly to workspace id or idx, the only
+                    // requirement is that there's only one framebuffer effect element with a given id +
+                    // namespace on the frame at once. Id + namespace is used as the cache key in the
+                    // damage tracker.
+                    let ns = Some(ws.id().get() as usize);
+                    let xray_pos = XrayPos::new(geo.loc, zoom);
+                    push_normal_from_layer!(Layer::Bottom, ns, xray_pos, process!(geo));
+                    push_normal_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
 
-                process!(geo)(ws.render_background());
-            }
+                    process!(geo)(ws.render_background());
+                }
+            } // end else (not workspace_overview_open)
         }
 
         mon.render_workspace_shadows(ctx.renderer, &mut |elem| push(elem.into()));
@@ -6209,7 +6276,7 @@ impl Niri {
         }
 
         if let Some(window) = &new_focus.window {
-            if !self.layout.is_overview_open() && current_focus.window.as_ref() != Some(window) {
+            if !self.layout.is_any_overview_open() && current_focus.window.as_ref() != Some(window) {
                 let (window, hit) = window;
 
                 // Don't trigger focus-follows-mouse over the tab indicator.

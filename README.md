@@ -31,6 +31,10 @@ When a monitor disconnects, its workspaces will move to another monitor, but upo
 - Built from the ground up for scrollable tiling
 - [Dynamic workspaces](https://niri-wm.github.io/niri/Workspaces.html) like in GNOME
 - An [Overview](https://github.com/user-attachments/assets/379a5d1f-acdb-4c11-b36c-e85fd91f0995) that zooms out workspaces and windows
+- **Workspace Overview** — a GNOME Activities-style overview showing all windows on the current workspace in a compact grid layout (toggle with `toggle-workspace-overview`)
+- **Window Overview** — shows all windows across all workspaces on the current monitor in a grid layout (toggle with `toggle-window-overview`)
+    - By default, floating windows are hidden in both overviews; pass `--show-floating` (or `show-floating=true` in config) to include them
+- **Configurable Hot Corners** — each corner can trigger Overview, Workspace Overview, or Window Overview independently
 - Built-in screenshot UI
 - Monitor and window screencasting through xdg-desktop-portal-gnome
     - You can [block out](https://niri-wm.github.io/niri/Configuration%3A-Window-Rules.html#block-out-from) sensitive windows from screencasts

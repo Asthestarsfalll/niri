@@ -152,6 +152,54 @@ impl MergeWith<OverviewPart> for Overview {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WorkspaceOverview {
+    pub max_scale: f64,
+    pub min_scale: f64,
+    pub gap: f64,
+    pub backdrop_color: Color,
+    pub focus_border_color: Color,
+    pub animation_duration: crate::animations::WorkspaceOverviewAnim,
+}
+
+impl Default for WorkspaceOverview {
+    fn default() -> Self {
+        Self {
+            max_scale: 0.95,
+            min_scale: 0.3,
+            gap: 16.,
+            backdrop_color: DEFAULT_BACKDROP_COLOR,
+            focus_border_color: Color::from_rgba8_unpremul(255, 192, 203, 255),
+            animation_duration: crate::animations::WorkspaceOverviewAnim::default(),
+        }
+    }
+}
+
+#[derive(knuffel::Decode, Debug, Clone, Copy, PartialEq)]
+pub struct WorkspaceOverviewPart {
+    #[knuffel(child, unwrap(argument))]
+    pub max_scale: Option<FloatOrInt<0, 1>>,
+    #[knuffel(child, unwrap(argument))]
+    pub min_scale: Option<FloatOrInt<0, 1>>,
+    #[knuffel(child, unwrap(argument))]
+    pub gap: Option<FloatOrInt<0, 200>>,
+    #[knuffel(child)]
+    pub backdrop_color: Option<Color>,
+    #[knuffel(child)]
+    pub focus_border_color: Option<Color>,
+    #[knuffel(child)]
+    pub animation_duration: Option<crate::animations::WorkspaceOverviewAnim>,
+}
+
+impl MergeWith<WorkspaceOverviewPart> for WorkspaceOverview {
+    fn merge_with(&mut self, part: &WorkspaceOverviewPart) {
+        merge!((self, part), max_scale, min_scale, gap);
+        merge_clone!((self, part), backdrop_color);
+        merge_clone!((self, part), focus_border_color);
+        merge_clone!((self, part), animation_duration);
+    }
+}
+
 #[derive(knuffel::Decode, Debug, Default, Clone, PartialEq, Eq)]
 pub struct Environment(#[knuffel(children)] pub Vec<EnvironmentVariable>);
 

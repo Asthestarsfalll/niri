@@ -914,6 +914,18 @@ pub enum Action {
     OpenOverview {},
     /// Close the Overview.
     CloseOverview {},
+    /// Toggle the workspace overview (GNOME Activities-style overview showing all windows on the current workspace).
+    ToggleWorkspaceOverview {
+        /// Whether to include floating windows.
+        #[cfg_attr(feature = "clap", arg(long))]
+        show_floating: bool,
+    },
+    /// Toggle the window overview showing all windows on the current monitor across all workspaces.
+    ToggleWindowOverview {
+        /// Whether to include floating windows.
+        #[cfg_attr(feature = "clap", arg(long))]
+        show_floating: bool,
+    },
     /// Toggle urgent status of a window.
     ToggleWindowUrgent {
         /// Id of the window to toggle urgent.

@@ -11,7 +11,7 @@ use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
 use super::insert_hint_element::{InsertHintElement, InsertHintRenderElement};
-use super::scrolling::{Column, ColumnWidth};
+use super::scrolling::{Column, ColumnWidth, ScrollingSpaceRenderElement};
 use super::tile::Tile;
 use super::workspace::{
     compute_working_area, OutputId, Workspace, WorkspaceAddWindowTarget, WorkspaceId,
@@ -21,6 +21,7 @@ use super::{compute_overview_zoom, ActivateWindow, HitType, LayoutElement, Optio
 use crate::animation::{Animation, Clock};
 use crate::input::swipe_tracker::SwipeTracker;
 use crate::niri_render_elements;
+use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::SolidColorRenderElement;
@@ -80,6 +81,20 @@ pub struct Monitor<W: LayoutElement> {
     pub(super) overview_open: bool,
     /// Progress of the overview zoom animation, 1 is fully in overview.
     overview_progress: Option<OverviewProgress>,
+    /// Whether the workspace overview is open.
+    pub(crate) workspace_overview_open: bool,
+    /// Progress of the workspace overview zoom animation, 1 is fully in workspace overview.
+    workspace_overview_progress: Option<OverviewProgress>,
+    /// Whether the window overview is open.
+    pub(crate) window_overview_open: bool,
+    /// Progress of the window overview zoom animation, 1 is fully in window overview.
+    window_overview_progress: Option<OverviewProgress>,
+    /// Windows excluded from the current overview session.
+    pub(super) overview_excluded_windows: Vec<W::Id>,
+    /// Whether to show floating windows in the overview.
+    pub(super) show_floating_overview: bool,
+    /// Index of the currently focused tile in the active overview.
+    pub(super) overview_focused_idx: usize,
     /// Clock for driving animations.
     pub(super) clock: Clock,
     /// Configurable properties of the layout as received from the parent layout.
@@ -190,6 +205,7 @@ niri_render_elements! {
         UncroppedInsertHint = InsertHintRenderElement,
         Shadow = ShadowRenderElement,
         SolidColor = SolidColorRenderElement,
+        Border = BorderRenderElement,
     }
 }
 
@@ -276,6 +292,10 @@ impl OverviewProgress {
             OverviewProgress::Value(v) => *v,
         }
     }
+
+    pub fn is_animating(&self) -> bool {
+        matches!(self, OverviewProgress::Animation(_))
+    }
 }
 
 impl From<&super::OverviewProgress> for OverviewProgress {
@@ -341,6 +361,13 @@ impl<W: LayoutElement> Monitor<W> {
             insert_hint_render_loc: None,
             overview_open: false,
             overview_progress: None,
+            workspace_overview_open: false,
+            workspace_overview_progress: None,
+            window_overview_open: false,
+            window_overview_progress: None,
+            overview_excluded_windows: Vec::new(),
+            show_floating_overview: false,
+            overview_focused_idx: 0,
             workspace_switch: None,
             clock,
             base_options,
@@ -1396,6 +1423,32 @@ impl<W: LayoutElement> Monitor<W> {
         self.overview_progress.as_ref().map(|p| p.value())
     }
 
+    pub(super) fn set_workspace_overview_progress(
+        &mut self,
+        progress: Option<&super::OverviewProgress>,
+    ) {
+        self.workspace_overview_progress = progress.map(OverviewProgress::from);
+    }
+
+    pub fn is_workspace_overview_animating(&self) -> bool {
+        self.workspace_overview_progress
+            .as_ref()
+            .is_some_and(|p| p.is_animating())
+    }
+
+    pub(super) fn set_window_overview_progress(
+        &mut self,
+        progress: Option<&super::OverviewProgress>,
+    ) {
+        self.window_overview_progress = progress.map(OverviewProgress::from);
+    }
+
+    pub fn is_window_overview_animating(&self) -> bool {
+        self.window_overview_progress
+            .as_ref()
+            .is_some_and(|p| p.is_animating())
+    }
+
     pub fn workspace_render_idx(&self) -> f64 {
         // If workspace switch and overview progress are matching animations, then compute a
         // correction term to make the movement appear monotonic.
@@ -1635,7 +1688,13 @@ impl<W: LayoutElement> Monitor<W> {
 
     pub fn render_above_top_layer(&self) -> bool {
         // Render above the top layer only if the view is stationary.
-        if self.workspace_switch.is_some() || self.overview_progress.is_some() {
+        if self.workspace_switch.is_some()
+            || self.overview_progress.is_some()
+            || self.workspace_overview_open
+            || self.is_workspace_overview_animating()
+            || self.window_overview_open
+            || self.is_window_overview_animating()
+        {
             return false;
         }
 
@@ -1776,6 +1835,317 @@ impl<W: LayoutElement> Monitor<W> {
                 );
                 push(elem);
             });
+        }
+    }
+
+    pub fn render_workspace_overview<R: NiriRenderer>(
+        &self,
+        mut ctx: RenderCtx<R>,
+        push: &mut dyn FnMut(MonitorRenderElement<R>),
+    ) {
+        let _span = tracy_client::span!("Monitor::render_workspace_overview");
+
+        let Some(progress) = self
+            .workspace_overview_progress
+            .as_ref()
+            .map(|p| p.clamped_value())
+        else {
+            return;
+        };
+
+        let progress = progress.clamp(0., 1.);
+        let output_scale = self.scale.fractional_scale();
+        let gap = self.options.workspace_overview.gap;
+        let max_scale = self.options.workspace_overview.max_scale;
+        let min_scale = self.options.workspace_overview.min_scale;
+
+        // Get the active workspace.
+        let active_ws = &self.workspaces[self.active_workspace_idx];
+
+        // Collect tiles filtered by exclusion list and floating preference.
+        let overview_tiles: Vec<_> = active_ws
+            .tiles()
+            .filter(|tile| {
+                if !self.show_floating_overview && active_ws.is_floating(tile.window().id()) {
+                    return false;
+                }
+                !self.overview_excluded_windows.contains(tile.window().id())
+            })
+            .collect();
+
+        // Collect tile sizes in stable order (not affected by active column).
+        let tile_sizes: Vec<Size<f64, Logical>> = overview_tiles
+            .iter()
+            .map(|tile| tile.tile_size().to_f64())
+            .collect();
+
+        // Compute overview layout positions with dynamic scale.
+        let (overview_positions, computed_scale) = super::compute_workspace_overview_positions(
+            &tile_sizes,
+            self.view_size,
+            gap,
+            max_scale,
+            min_scale,
+        );
+
+        // Build stable tile list for position lookup.
+        let stable_tiles: Vec<_> = overview_tiles;
+
+        // Interpolated scale: from 1.0 (normal) to computed_scale (overview).
+        let scale = 1. - progress * (1. - computed_scale);
+
+        // Grid offset for workspace switching animation.
+        // Offset relative to active workspace: 0 when no switching, slides during transition.
+        let render_idx = self.workspace_render_idx();
+        let grid_offset_y = (self.active_workspace_idx as f64 - render_idx) * self.view_size.h;
+
+        // Crop bounds shifted by grid offset so tiles stay visible during workspace switch.
+        let crop_y = (grid_offset_y * output_scale).round() as i32;
+        let crop_bounds = Rectangle::new(
+            Point::from((0, crop_y)),
+            self.view_size.to_physical_precise_round(output_scale),
+        );
+
+        // Render each tile, animating from current position to overview position.
+        // Use tiles_with_render_positions() for rendering order, but look up
+        // overview positions by tile ID to stay stable across focus changes.
+        let mut idx = 0;
+        for (tile, current_pos, _visible) in active_ws.tiles_with_render_positions() {
+            let Some(tile_idx) = stable_tiles.iter().position(|t| std::ptr::eq(*t, tile)) else {
+                continue;
+            };
+            let (overview_pos, scaled_size) = overview_positions[tile_idx];
+
+            // Compute the interpolated top-left position with grid offset.
+            let tile_pos: Point<f64, Logical> = Point::from((
+                current_pos.x + (overview_pos.x - current_pos.x) * progress,
+                current_pos.y + (overview_pos.y - current_pos.y) * progress + grid_offset_y,
+            ));
+
+            // Render the tile.
+            let mut tile_elements = Vec::new();
+            tile.render(
+                ctx.r(),
+                Point::from((0., 0.)),
+                XrayPos::default(),
+                idx == self.overview_focused_idx,
+                &mut |elem| tile_elements.push(elem),
+            );
+
+            for elem in tile_elements {
+                let scroll_elem = ScrollingSpaceRenderElement::Tile(elem);
+                let ws_elem = WorkspaceRenderElement::Scrolling(scroll_elem);
+                let elem = CropRenderElement::from_element(ws_elem, output_scale, crop_bounds);
+                if let Some(elem) = elem {
+                    let elem = MonitorInnerRenderElement::Workspace(elem);
+                    let elem = RescaleRenderElement::from_element(elem, Point::from((0, 0)), scale);
+                    let elem = RelocateRenderElement::from_element(
+                        elem,
+                        tile_pos.to_physical_precise_round(output_scale),
+                        Relocate::Relative,
+                    );
+                    push(elem);
+                }
+            }
+
+            // Render overview focus border around the focused tile.
+            if idx == self.overview_focused_idx && scaled_size.w > 0. && scaled_size.h > 0. {
+                let tile_size = tile.tile_size().to_f64();
+                let bw = 3.0;
+
+                let border_color = self.options.workspace_overview.focus_border_color;
+                let border_size = Size::from((
+                    (tile_size.w + bw * 2.0).max(1.0),
+                    (tile_size.h + bw * 2.0).max(1.0),
+                ));
+                let border_rect = Rectangle::new(Point::from((-bw, -bw)), border_size);
+                let corner_radius = tile.window().geometry_corner_radius();
+                let outer_radius = CornerRadius {
+                    top_left: corner_radius.top_left + bw as f32,
+                    top_right: corner_radius.top_right + bw as f32,
+                    bottom_right: corner_radius.bottom_right + bw as f32,
+                    bottom_left: corner_radius.bottom_left + bw as f32,
+                };
+                let border_elem = BorderRenderElement::new(
+                    border_size,
+                    border_rect,
+                    Default::default(),
+                    border_color,
+                    border_color,
+                    0.,
+                    border_rect,
+                    bw as f32,
+                    outer_radius,
+                    scale as f32,
+                    1.,
+                );
+                let inner = MonitorInnerRenderElement::Border(border_elem);
+                let elem = RescaleRenderElement::from_element(inner, Point::from((0, 0)), scale);
+                let elem = RelocateRenderElement::from_element(
+                    elem,
+                    tile_pos.to_physical_precise_round(output_scale),
+                    Relocate::Relative,
+                );
+                push(elem);
+            }
+
+            idx += 1;
+        }
+    }
+
+    pub fn render_window_overview<R: NiriRenderer>(
+        &self,
+        mut ctx: RenderCtx<R>,
+        push: &mut dyn FnMut(MonitorRenderElement<R>),
+    ) {
+        let _span = tracy_client::span!("Monitor::render_window_overview");
+
+        let Some(progress) = self
+            .window_overview_progress
+            .as_ref()
+            .map(|p| p.clamped_value())
+        else {
+            return;
+        };
+
+        let progress = progress.clamp(0., 1.);
+        let output_scale = self.scale.fractional_scale();
+        let gap = self.options.workspace_overview.gap;
+        let max_scale = self.options.workspace_overview.max_scale;
+        let min_scale = self.options.workspace_overview.min_scale;
+
+        // Collect tiles in stable order for grid computation (filtered by exclusion list and floating preference).
+        let overview_tiles: Vec<_> = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| {
+                ws.tiles().filter(|tile| {
+                    if !self.show_floating_overview && ws.is_floating(tile.window().id()) {
+                        return false;
+                    }
+                    !self.overview_excluded_windows.contains(tile.window().id())
+                })
+            })
+            .collect();
+
+        let tile_sizes: Vec<Size<f64, Logical>> =
+            overview_tiles.iter().map(|tile| tile.tile_size().to_f64()).collect();
+
+        let (overview_positions, computed_scale) = super::compute_workspace_overview_positions(
+            &tile_sizes,
+            self.view_size,
+            gap,
+            max_scale,
+            min_scale,
+        );
+
+        let scale = 1. - progress * (1. - computed_scale);
+
+        // Workspace switching animation offset.
+        let render_idx = self.workspace_render_idx();
+
+        // Crop bounds (fixed to view).
+        let crop_bounds = Rectangle::new(
+            Point::from((0, 0)),
+            self.view_size.to_physical_precise_round(output_scale),
+        );
+
+        // Render each tile, animating from its current global position to the overview grid.
+        let mut idx = 0;
+        for (ws_idx, ws) in self.workspaces.iter().enumerate() {
+            let ws_offset_y = (ws_idx as f64 - render_idx) * self.view_size.h;
+
+            for (tile, current_pos, _visible) in ws.tiles_with_render_positions() {
+                if self.overview_excluded_windows.contains(tile.window().id()) {
+                    continue;
+                }
+
+                let Some(tile_idx) = overview_tiles.iter().position(|t| std::ptr::eq(*t, tile))
+                else {
+                    continue;
+                };
+                let (overview_pos, scaled_size) = overview_positions[tile_idx];
+
+                // Current global position: within-workspace position + workspace offset.
+                let global_pos: Point<f64, Logical> = Point::from((
+                    current_pos.x,
+                    current_pos.y + ws_offset_y,
+                ));
+
+                // Interpolate between current global position and overview grid position.
+                let tile_pos = Point::from((
+                    global_pos.x + (overview_pos.x - global_pos.x) * progress,
+                    global_pos.y + (overview_pos.y - global_pos.y) * progress,
+                ));
+
+                let mut tile_elements = Vec::new();
+                tile.render(
+                    ctx.r(),
+                    Point::from((0., 0.)),
+                    XrayPos::default(),
+                    idx == self.overview_focused_idx,
+                    &mut |elem| tile_elements.push(elem),
+                );
+
+                for elem in tile_elements {
+                    let scroll_elem = ScrollingSpaceRenderElement::Tile(elem);
+                    let ws_elem = WorkspaceRenderElement::Scrolling(scroll_elem);
+                    let elem = CropRenderElement::from_element(ws_elem, output_scale, crop_bounds);
+                    if let Some(elem) = elem {
+                        let elem = MonitorInnerRenderElement::Workspace(elem);
+                        let elem = RescaleRenderElement::from_element(elem, Point::from((0, 0)), scale);
+                        let elem = RelocateRenderElement::from_element(
+                            elem,
+                            tile_pos.to_physical_precise_round(output_scale),
+                            Relocate::Relative,
+                        );
+                        push(elem);
+                    }
+                }
+
+                // Render overview focus border around the focused tile.
+                if idx == self.overview_focused_idx && scaled_size.w > 0. && scaled_size.h > 0. {
+                    let tile_size = tile.tile_size().to_f64();
+                    let bw = 3.0;
+
+                    let border_color = self.options.workspace_overview.focus_border_color;
+                    let border_size = Size::from((
+                        (tile_size.w + bw * 2.0).max(1.0),
+                        (tile_size.h + bw * 2.0).max(1.0),
+                    ));
+                    let border_rect = Rectangle::new(Point::from((-bw, -bw)), border_size);
+                    let corner_radius = tile.window().geometry_corner_radius();
+                    let outer_radius = CornerRadius {
+                        top_left: corner_radius.top_left + bw as f32,
+                        top_right: corner_radius.top_right + bw as f32,
+                        bottom_right: corner_radius.bottom_right + bw as f32,
+                        bottom_left: corner_radius.bottom_left + bw as f32,
+                    };
+                    let border_elem = BorderRenderElement::new(
+                        border_size,
+                        border_rect,
+                        Default::default(),
+                        border_color,
+                        border_color,
+                        0.,
+                        border_rect,
+                        bw as f32,
+                        outer_radius,
+                        scale as f32,
+                        1.,
+                    );
+                    let inner = MonitorInnerRenderElement::Border(border_elem);
+                    let elem =
+                        RescaleRenderElement::from_element(inner, Point::from((0, 0)), scale);
+                    let elem = RelocateRenderElement::from_element(
+                        elem,
+                        tile_pos.to_physical_precise_round(output_scale),
+                        Relocate::Relative,
+                    );
+                    push(elem);
+                }
+                idx += 1;
+            }
         }
     }
 

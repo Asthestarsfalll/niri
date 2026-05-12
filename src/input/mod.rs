@@ -6,7 +6,8 @@ use std::time::Duration;
 use calloop::timer::{TimeoutAction, Timer};
 use input::event::gesture::GestureEventCoordinates as _;
 use niri_config::{
-    Action, Bind, Binds, Config, Key, ModKey, Modifiers, MruDirection, SwitchBinds, Trigger,
+    Action, Bind, Binds, Config, HotCornerAction, Key, ModKey, Modifiers, MruDirection,
+    SwitchBinds, Trigger,
 };
 use niri_ipc::LayoutSwitchTarget;
 use smithay::backend::input::{
@@ -526,6 +527,90 @@ impl State {
                     {
                         pointer.unset_grab(this, serial, time);
                         this.niri.suppressed_keys.insert(key_code);
+                        return FilterResult::Intercept(None);
+                    }
+
+                    // Close workspace/window overview on Escape.
+                    let mut closed = false;
+                    if this.niri.layout.is_workspace_overview_open() {
+                        this.niri.layout.close_workspace_overview();
+                        closed = true;
+                    }
+                    if this.niri.layout.is_window_overview_open() {
+                        this.niri.layout.close_window_overview();
+                        closed = true;
+                    }
+                    if closed {
+                        this.niri.suppressed_keys.insert(key_code);
+                        this.niri.queue_redraw_all();
+                        return FilterResult::Intercept(None);
+                    }
+                }
+
+                if pressed
+                    && raw == Some(Keysym::Return)
+                    && (this.niri.layout.is_workspace_overview_open()
+                        || this.niri.layout.is_window_overview_open())
+                {
+                    let mut activated = false;
+
+                    // Try to activate the focused overview window first.
+                    if this.niri.layout.is_workspace_overview_open() {
+                        if let Some(window_id) = this.niri.layout.workspace_overview_focused_window() {
+                            this.niri.layout.close_workspace_overview();
+                            this.niri.layout.activate_window(&window_id);
+                            activated = true;
+                        } else {
+                            this.niri.layout.close_workspace_overview();
+                            activated = true;
+                        }
+                    }
+
+                    if !activated && this.niri.layout.is_window_overview_open() {
+                        if let Some(window_id) = this.niri.layout.window_overview_focused_window() {
+                            this.niri.layout.close_window_overview();
+                            this.niri.layout.activate_window(&window_id);
+                            activated = true;
+                        } else {
+                            this.niri.layout.close_window_overview();
+                            activated = true;
+                        }
+                    }
+
+                    if activated {
+                        this.niri.suppressed_keys.insert(key_code);
+                        this.niri.queue_redraw_all();
+                        return FilterResult::Intercept(None);
+                    }
+                }
+
+                // Navigate overview focus with hjkl/arrows (with or without Mod).
+                if pressed
+                    && (this.niri.layout.is_workspace_overview_open()
+                        || this.niri.layout.is_window_overview_open())
+                {
+                    let handled = match raw {
+                        Some(Keysym::h) | Some(Keysym::Left) => {
+                            this.niri.layout.overview_focus_left();
+                            true
+                        }
+                        Some(Keysym::j) | Some(Keysym::Down) => {
+                            this.niri.layout.overview_focus_down();
+                            true
+                        }
+                        Some(Keysym::k) | Some(Keysym::Up) => {
+                            this.niri.layout.overview_focus_up();
+                            true
+                        }
+                        Some(Keysym::l) | Some(Keysym::Right) => {
+                            this.niri.layout.overview_focus_right();
+                            true
+                        }
+                        _ => false,
+                    };
+                    if handled {
+                        this.niri.suppressed_keys.insert(key_code);
+                        this.niri.queue_redraw_all();
                         return FilterResult::Intercept(None);
                     }
                 }
@@ -2285,6 +2370,14 @@ impl State {
                     self.niri.queue_redraw_all();
                 }
             }
+            Action::ToggleWorkspaceOverview(show_floating) => {
+                self.niri.layout.toggle_workspace_overview_with_floating(show_floating);
+                self.niri.queue_redraw_all();
+            }
+            Action::ToggleWindowOverview(show_floating) => {
+                self.niri.layout.toggle_window_overview_with_floating(show_floating);
+                self.niri.queue_redraw_all();
+            }
             Action::ToggleWindowUrgent(id) => {
                 let window = self
                     .niri
@@ -2631,7 +2724,19 @@ impl State {
                     .with_grab(|_, grab| grab_allows_hot_corner(grab))
                     .unwrap_or(true)
             {
-                self.niri.layout.toggle_overview();
+                let action = self
+                    .niri
+                    .hot_corner_action_at(new_pos)
+                    .unwrap_or(HotCornerAction::Overview);
+                match action {
+                    HotCornerAction::Overview => self.niri.layout.toggle_overview(),
+                    HotCornerAction::WorkspaceOverview => {
+                        self.niri.layout.toggle_workspace_overview()
+                    }
+                    HotCornerAction::WindowOverview => {
+                        self.niri.layout.toggle_window_overview()
+                    }
+                }
             }
             self.niri.pointer_inside_hot_corner = true;
         }
@@ -2718,7 +2823,19 @@ impl State {
                     .with_grab(|_, grab| grab_allows_hot_corner(grab))
                     .unwrap_or(true)
             {
-                self.niri.layout.toggle_overview();
+                let action = self
+                    .niri
+                    .hot_corner_action_at(pos)
+                    .unwrap_or(HotCornerAction::Overview);
+                match action {
+                    HotCornerAction::Overview => self.niri.layout.toggle_overview(),
+                    HotCornerAction::WorkspaceOverview => {
+                        self.niri.layout.toggle_workspace_overview()
+                    }
+                    HotCornerAction::WindowOverview => {
+                        self.niri.layout.toggle_window_overview()
+                    }
+                }
             }
             self.niri.pointer_inside_hot_corner = true;
         }
@@ -2821,6 +2938,72 @@ impl State {
             self.niri.tablet_cursor_location = None;
 
             let is_overview_open = self.niri.layout.is_overview_open();
+
+            // Handle workspace overview clicks before any normal window handling.
+            if self.niri.layout.is_workspace_overview_open() && button_state == ButtonState::Pressed
+            {
+                let output = self
+                    .niri
+                    .output_under(pointer.current_location())
+                    .map(|(o, _)| o);
+                if let Some(output) = output {
+                    let geom = self.niri.global_space.output_geometry(output).unwrap();
+                    let pos_within_output = pointer.current_location() - geom.loc.to_f64();
+                    if let Some(window_id) = self
+                        .niri
+                        .layout
+                        .workspace_overview_window_at(pos_within_output)
+                    {
+                        if button == Some(MouseButton::Right) {
+                            // Right-click: exclude from overview view.
+                            self.niri.layout.add_overview_excluded_window(&window_id);
+                        } else {
+                            self.niri.layout.close_workspace_overview();
+                            self.niri.layout.activate_window(&window_id);
+                        }
+                    } else {
+                        self.niri.layout.close_workspace_overview();
+                    }
+                    self.niri.queue_redraw_all();
+                    return;
+                }
+                self.niri.layout.close_workspace_overview();
+                self.niri.queue_redraw_all();
+                return;
+            }
+
+            // Handle window overview clicks before any normal window handling.
+            if self.niri.layout.is_window_overview_open() && button_state == ButtonState::Pressed
+            {
+                let output = self
+                    .niri
+                    .output_under(pointer.current_location())
+                    .map(|(o, _)| o);
+                if let Some(output) = output {
+                    let geom = self.niri.global_space.output_geometry(output).unwrap();
+                    let pos_within_output = pointer.current_location() - geom.loc.to_f64();
+                    if let Some(window_id) = self
+                        .niri
+                        .layout
+                        .window_overview_window_at(pos_within_output)
+                    {
+                        if button == Some(MouseButton::Right) {
+                            // Right-click: exclude from overview view.
+                            self.niri.layout.add_overview_excluded_window(&window_id);
+                        } else {
+                            self.niri.layout.close_window_overview();
+                            self.niri.layout.activate_window(&window_id);
+                        }
+                    } else {
+                        self.niri.layout.close_window_overview();
+                    }
+                    self.niri.queue_redraw_all();
+                    return;
+                }
+                self.niri.layout.close_window_overview();
+                self.niri.queue_redraw_all();
+                return;
+            }
 
             if is_overview_open && !pointer.is_grabbed() && button == Some(MouseButton::Right) {
                 if let Some((output, ws)) = self.niri.workspace_under_cursor(true) {
@@ -3089,7 +3272,7 @@ impl State {
         let horizontal_amount_v120 = event.amount_v120(Axis::Horizontal);
         let vertical_amount_v120 = event.amount_v120(Axis::Vertical);
 
-        let is_overview_open = self.niri.layout.is_overview_open();
+        let is_overview_open = self.niri.layout.is_any_overview_open();
 
         // We should only handle scrolling in the overview if the pointer is not over a (top or
         // overlay) layer surface.
@@ -3627,7 +3810,7 @@ impl State {
         };
         let tip_state = event.tip_state();
 
-        let is_overview_open = self.niri.layout.is_overview_open();
+        let is_overview_open = self.niri.layout.is_any_overview_open();
 
         match tip_state {
             TabletToolTipState::Down => {
@@ -3894,7 +4077,7 @@ impl State {
             }
         }
 
-        let is_overview_open = self.niri.layout.is_overview_open();
+        let is_overview_open = self.niri.layout.is_any_overview_open();
 
         if let Some((cx, cy)) = &mut self.niri.gesture_swipe_3f_cumulative {
             *cx += delta_x;

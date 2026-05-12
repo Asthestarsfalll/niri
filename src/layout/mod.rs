@@ -364,6 +364,20 @@ pub struct Layout<W: LayoutElement> {
     overview_open: bool,
     /// The overview zoom progress.
     overview_progress: Option<OverviewProgress>,
+    /// Whether the workspace overview is open.
+    workspace_overview_open: bool,
+    /// The workspace overview zoom progress.
+    workspace_overview_progress: Option<OverviewProgress>,
+    /// Whether the window overview is open.
+    window_overview_open: bool,
+    /// The window overview zoom progress.
+    window_overview_progress: Option<OverviewProgress>,
+    /// Windows excluded from the current overview session.
+    overview_excluded_windows: Vec<W::Id>,
+    /// Whether to show floating windows in the overview.
+    show_floating_overview: bool,
+    /// Index of the currently focused tile in the active overview.
+    overview_focused_idx: usize,
     /// Configurable properties of the layout.
     options: Rc<Options>,
 }
@@ -392,6 +406,7 @@ pub struct Options {
     pub animations: niri_config::Animations,
     pub gestures: niri_config::Gestures,
     pub overview: niri_config::Overview,
+    pub workspace_overview: niri_config::WorkspaceOverview,
     pub blur: niri_config::Blur,
     // Debug flags.
     pub disable_resize_throttling: bool,
@@ -653,6 +668,7 @@ impl Options {
             animations: config.animations.clone(),
             gestures: config.gestures,
             overview: config.overview,
+            workspace_overview: config.workspace_overview,
             blur: config.blur,
             disable_resize_throttling: config.debug.disable_resize_throttling,
             disable_transactions: config.debug.disable_transactions,
@@ -703,6 +719,13 @@ impl<W: LayoutElement> Layout<W> {
             update_render_elements_time: Duration::ZERO,
             overview_open: false,
             overview_progress: None,
+            workspace_overview_open: false,
+            workspace_overview_progress: None,
+            window_overview_open: false,
+            window_overview_progress: None,
+            overview_excluded_windows: Vec::new(),
+            show_floating_overview: false,
+            overview_focused_idx: 0,
             options: Rc::new(options),
         }
     }
@@ -728,6 +751,13 @@ impl<W: LayoutElement> Layout<W> {
             update_render_elements_time: Duration::ZERO,
             overview_open: false,
             overview_progress: None,
+            workspace_overview_open: false,
+            workspace_overview_progress: None,
+            window_overview_open: false,
+            window_overview_progress: None,
+            overview_excluded_windows: Vec::new(),
+            show_floating_overview: false,
+            overview_focused_idx: 0,
             options: opts,
         }
     }
@@ -2709,10 +2739,32 @@ impl<W: LayoutElement> Layout<W> {
             }
         }
 
+        if let Some(OverviewProgress::Animation(anim)) = &mut self.workspace_overview_progress {
+            if anim.is_done() {
+                if self.workspace_overview_open {
+                    self.workspace_overview_progress = Some(OverviewProgress::Open);
+                } else {
+                    self.workspace_overview_progress = None;
+                }
+            }
+        }
+
+        if let Some(OverviewProgress::Animation(anim)) = &mut self.window_overview_progress {
+            if anim.is_done() {
+                if self.window_overview_open {
+                    self.window_overview_progress = Some(OverviewProgress::Open);
+                } else {
+                    self.window_overview_progress = None;
+                }
+            }
+        }
+
         match &mut self.monitor_set {
             MonitorSet::Normal { monitors, .. } => {
                 for mon in monitors {
                     mon.set_overview_progress(self.overview_progress.as_ref());
+                    mon.set_workspace_overview_progress(self.workspace_overview_progress.as_ref());
+                    mon.set_window_overview_progress(self.window_overview_progress.as_ref());
                     mon.advance_animations();
                 }
             }
@@ -2747,6 +2799,22 @@ impl<W: LayoutElement> Layout<W> {
 
         if self
             .overview_progress
+            .as_ref()
+            .is_some_and(|p| p.is_animation())
+        {
+            return true;
+        }
+
+        if self
+            .workspace_overview_progress
+            .as_ref()
+            .is_some_and(|p| p.is_animation())
+        {
+            return true;
+        }
+
+        if self
+            .window_overview_progress
             .as_ref()
             .is_some_and(|p| p.is_animation())
         {
@@ -4594,6 +4662,18 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn toggle_overview(&mut self) {
+        // Close workspace and window overviews if open (mutual exclusion).
+        if self.workspace_overview_open {
+            self.workspace_overview_open = false;
+            self.workspace_overview_progress = None;
+            self.overview_excluded_windows.clear();
+        }
+        if self.window_overview_open {
+            self.window_overview_open = false;
+            self.window_overview_progress = None;
+            self.overview_excluded_windows.clear();
+        }
+
         self.overview_open = !self.overview_open;
 
         let from = self.overview_progress.take().map_or(0., |p| p.value());
@@ -4608,6 +4688,8 @@ impl<W: LayoutElement> Layout<W> {
         )));
 
         self.set_monitors_overview_state();
+        self.set_monitors_workspace_overview_state();
+        self.set_monitors_window_overview_state();
     }
 
     pub fn open_overview(&mut self) -> bool {
@@ -4634,6 +4716,491 @@ impl<W: LayoutElement> Layout<W> {
             mon.activate_workspace_with_anim_config(ws_idx, Some(config));
         }
         self.toggle_overview();
+    }
+
+    pub fn toggle_workspace_overview(&mut self) {
+        self.toggle_workspace_overview_with_floating(self.show_floating_overview);
+    }
+
+    pub fn toggle_workspace_overview_with_floating(&mut self, show_floating: bool) {
+        self.show_floating_overview = show_floating;
+
+        // Close other overviews if open (mutual exclusion).
+        if self.overview_open {
+            self.overview_open = false;
+            self.overview_progress = None;
+        }
+        if self.window_overview_open {
+            self.window_overview_open = false;
+            self.window_overview_progress = None;
+            self.overview_excluded_windows.clear();
+        }
+
+        self.workspace_overview_open = !self.workspace_overview_open;
+
+        if !self.workspace_overview_open {
+            self.overview_excluded_windows.clear();
+        }
+
+        let from = self
+            .workspace_overview_progress
+            .take()
+            .map_or(0., |p| p.value());
+        let to = if self.workspace_overview_open { 1. } else { 0. };
+
+        self.workspace_overview_progress = Some(OverviewProgress::Animation(Animation::new(
+            self.clock.clone(),
+            from,
+            to,
+            0.,
+            self.options.workspace_overview.animation_duration.0,
+        )));
+
+        self.overview_focused_idx = 0;
+
+        self.set_monitors_workspace_overview_state();
+    }
+
+    pub fn open_workspace_overview(&mut self) -> bool {
+        if self.workspace_overview_open {
+            return false;
+        }
+
+        self.toggle_workspace_overview();
+        true
+    }
+
+    pub fn close_workspace_overview(&mut self) -> bool {
+        if !self.workspace_overview_open {
+            return false;
+        }
+
+        self.overview_excluded_windows.clear();
+        self.toggle_workspace_overview();
+        true
+    }
+
+    pub fn is_workspace_overview_open(&self) -> bool {
+        self.workspace_overview_open
+    }
+
+    /// Find which window is under the cursor in the workspace overview.
+    ///
+    /// Takes the cursor position within the output and returns the window ID if one is hit.
+    pub fn workspace_overview_window_at(&self, pos: Point<f64, Logical>) -> Option<W::Id> {
+        let mon = self.active_monitor_ref()?;
+        let active_ws = &mon.workspaces[mon.active_workspace_idx];
+
+        // Collect tiles filtered by exclusion list and floating preference.
+        let overview_tiles: Vec<_> = active_ws
+            .tiles()
+            .filter(|tile| {
+                if !self.show_floating_overview && active_ws.is_floating(tile.window().id()) {
+                    return false;
+                }
+                !self.overview_excluded_windows.contains(tile.window().id())
+            })
+            .collect();
+
+        // Collect tile sizes in stable order (same as render_workspace_overview).
+        let tile_sizes: Vec<Size<f64, Logical>> = overview_tiles
+            .iter()
+            .map(|tile| tile.tile_size().to_f64())
+            .collect();
+
+        let gap = self.options.workspace_overview.gap;
+        let max_scale = self.options.workspace_overview.max_scale;
+        let min_scale = self.options.workspace_overview.min_scale;
+
+        let (positions, _scale) = compute_workspace_overview_positions(
+            &tile_sizes,
+            mon.view_size(),
+            gap,
+            max_scale,
+            min_scale,
+        );
+
+        // Build stable tile list for position lookup.
+        let stable_tiles: Vec<_> = overview_tiles;
+
+        // Adjust cursor position by grid offset (same as rendering).
+        let render_idx = mon.workspace_render_idx();
+        let grid_offset_y = (mon.active_workspace_idx() as f64 - render_idx) * mon.view_size().h;
+        let adjusted_pos = Point::from((pos.x, pos.y - grid_offset_y));
+
+        // Check which tile is under the cursor using render order.
+        for (tile, _, _) in active_ws.tiles_with_render_positions() {
+            if let Some(tile_idx) = stable_tiles.iter().position(|t| std::ptr::eq(*t, tile)) {
+                let (overview_pos, scaled_size) = positions[tile_idx];
+                let rect = Rectangle::new(overview_pos, scaled_size);
+                if rect.contains(adjusted_pos) {
+                    return Some(tile.window().id().clone());
+                }
+            }
+        }
+
+        None
+    }
+
+    pub fn set_monitors_workspace_overview_state(&mut self) {
+        let monitors = match &mut self.monitor_set {
+            MonitorSet::Normal { monitors, .. } => monitors,
+            MonitorSet::NoOutputs { .. } => return,
+        };
+
+        for mon in monitors {
+            mon.workspace_overview_open = self.workspace_overview_open;
+            mon.set_workspace_overview_progress(self.workspace_overview_progress.as_ref());
+            mon.overview_excluded_windows = self.overview_excluded_windows.clone();
+            mon.show_floating_overview = self.show_floating_overview;
+            mon.overview_focused_idx = self.overview_focused_idx;
+        }
+    }
+
+    pub fn toggle_window_overview(&mut self) {
+        self.toggle_window_overview_with_floating(self.show_floating_overview);
+    }
+
+    pub fn toggle_window_overview_with_floating(&mut self, show_floating: bool) {
+        self.show_floating_overview = show_floating;
+
+        // Close other overviews if open (mutual exclusion).
+        if self.overview_open {
+            self.overview_open = false;
+            self.overview_progress = None;
+        }
+        if self.workspace_overview_open {
+            self.workspace_overview_open = false;
+            self.workspace_overview_progress = None;
+            self.overview_excluded_windows.clear();
+        }
+
+        self.window_overview_open = !self.window_overview_open;
+
+        if !self.window_overview_open {
+            self.overview_excluded_windows.clear();
+        }
+
+        let from = self
+            .window_overview_progress
+            .take()
+            .map_or(0., |p| p.value());
+        let to = if self.window_overview_open { 1. } else { 0. };
+
+        self.window_overview_progress = Some(OverviewProgress::Animation(Animation::new(
+            self.clock.clone(),
+            from,
+            to,
+            0.,
+            self.options.workspace_overview.animation_duration.0,
+        )));
+
+        self.overview_focused_idx = 0;
+
+        self.set_monitors_window_overview_state();
+    }
+
+    pub fn open_window_overview(&mut self) -> bool {
+        if self.window_overview_open {
+            return false;
+        }
+
+        self.toggle_window_overview();
+        true
+    }
+
+    pub fn close_window_overview(&mut self) -> bool {
+        if !self.window_overview_open {
+            return false;
+        }
+
+        self.overview_excluded_windows.clear();
+        self.toggle_window_overview();
+        true
+    }
+
+    pub fn is_window_overview_open(&self) -> bool {
+        self.window_overview_open
+    }
+
+    /// Find which window is under the cursor in the window overview.
+    pub fn window_overview_window_at(&self, pos: Point<f64, Logical>) -> Option<W::Id> {
+        let mon = self.active_monitor_ref()?;
+
+        let overview_tiles: Vec<_> = mon
+            .workspaces
+            .iter()
+            .flat_map(|ws| {
+                ws.tiles().filter(|tile| {
+                    if !self.show_floating_overview && ws.is_floating(tile.window().id()) {
+                        return false;
+                    }
+                    !self.overview_excluded_windows.contains(tile.window().id())
+                })
+            })
+            .collect();
+
+        let tile_sizes: Vec<Size<f64, Logical>> = overview_tiles
+            .iter()
+            .map(|tile| tile.tile_size().to_f64())
+            .collect();
+
+        let gap = self.options.workspace_overview.gap;
+        let max_scale = self.options.workspace_overview.max_scale;
+        let min_scale = self.options.workspace_overview.min_scale;
+
+        let (positions, _scale) = compute_workspace_overview_positions(
+            &tile_sizes,
+            mon.view_size(),
+            gap,
+            max_scale,
+            min_scale,
+        );
+
+        let stable_tiles: Vec<_> = overview_tiles;
+
+        for (tile, (overview_pos, _scaled_size)) in
+            stable_tiles.iter().zip(positions.iter())
+        {
+            let rect = Rectangle::new(*overview_pos, *_scaled_size);
+            if rect.contains(pos) {
+                return Some(tile.window().id().clone());
+            }
+        }
+
+        None
+    }
+
+    pub fn add_overview_excluded_window(&mut self, window_id: &W::Id) {
+        self.overview_excluded_windows.push(window_id.clone());
+        self.set_monitors_workspace_overview_state();
+        self.set_monitors_window_overview_state();
+    }
+
+    /// Returns the window ID at the focused index in the workspace overview.
+    pub fn workspace_overview_focused_window(&self) -> Option<W::Id> {
+        let mon = self.active_monitor_ref()?;
+        let active_ws = &mon.workspaces[mon.active_workspace_idx];
+
+        let overview_tiles: Vec<_> = active_ws
+            .tiles()
+            .filter(|tile| {
+                if !self.show_floating_overview && active_ws.is_floating(tile.window().id()) {
+                    return false;
+                }
+                !self.overview_excluded_windows.contains(tile.window().id())
+            })
+            .collect();
+
+        let idx = self.overview_focused_idx.min(overview_tiles.len().saturating_sub(1));
+        overview_tiles.get(idx).map(|tile| tile.window().id().clone())
+    }
+
+    /// Returns the window ID at the focused index in the window overview.
+    pub fn window_overview_focused_window(&self) -> Option<W::Id> {
+        let mon = self.active_monitor_ref()?;
+
+        let overview_tiles: Vec<_> = mon
+            .workspaces
+            .iter()
+            .flat_map(|ws| {
+                ws.tiles().filter(|tile| {
+                    if !self.show_floating_overview && ws.is_floating(tile.window().id()) {
+                        return false;
+                    }
+                    !self.overview_excluded_windows.contains(tile.window().id())
+                })
+            })
+            .collect();
+
+        let idx = self.overview_focused_idx.min(overview_tiles.len().saturating_sub(1));
+        overview_tiles.get(idx).map(|tile| tile.window().id().clone())
+    }
+
+    fn overview_navigate_focus(&mut self, delta_x: isize, delta_y: isize) {
+        let mon = match self.active_monitor_ref() {
+            Some(mon) => mon,
+            None => return,
+        };
+
+        let overview_tiles: Vec<_>;
+        let tile_sizes: Vec<Size<f64, Logical>>;
+
+        if self.workspace_overview_open {
+            let active_ws = &mon.workspaces[mon.active_workspace_idx];
+            let tiles: Vec<_> = active_ws
+                .tiles()
+                .filter(|tile| {
+                    if !self.show_floating_overview && active_ws.is_floating(tile.window().id()) {
+                        return false;
+                    }
+                    !self.overview_excluded_windows.contains(tile.window().id())
+                })
+                .collect();
+            tile_sizes = tiles.iter().map(|t| t.tile_size().to_f64()).collect();
+            overview_tiles = tiles;
+        } else if self.window_overview_open {
+            let tiles: Vec<_> = mon
+                .workspaces
+                .iter()
+                .flat_map(|ws| {
+                    ws.tiles().filter(|tile| {
+                        if !self.show_floating_overview && ws.is_floating(tile.window().id()) {
+                            return false;
+                        }
+                        !self.overview_excluded_windows.contains(tile.window().id())
+                    })
+                })
+                .collect();
+            tile_sizes = tiles.iter().map(|t| t.tile_size().to_f64()).collect();
+            overview_tiles = tiles;
+        } else {
+            return;
+        }
+
+        if overview_tiles.is_empty() {
+            return;
+        }
+
+        let gap = self.options.workspace_overview.gap;
+        let max_scale = self.options.workspace_overview.max_scale;
+        let min_scale = self.options.workspace_overview.min_scale;
+
+        let (positions, _) = compute_workspace_overview_positions(
+            &tile_sizes,
+            mon.view_size(),
+            gap,
+            max_scale,
+            min_scale,
+        );
+
+        let current_idx = self.overview_focused_idx.min(overview_tiles.len() - 1);
+        let current_center: Point<f64, Logical> = {
+            let (pos, size) = &positions[current_idx];
+            Point::from((pos.x + size.w / 2., pos.y + size.h / 2.))
+        };
+
+        let mut best_idx = current_idx;
+        let mut best_dist = f64::MAX;
+
+        for (idx, (pos, size)) in positions.iter().enumerate() {
+            if idx == current_idx {
+                continue;
+            }
+
+            let center: Point<f64, Logical> = Point::from((pos.x + size.w / 2., pos.y + size.h / 2.));
+            let dx = center.x - current_center.x;
+            let dy = center.y - current_center.y;
+
+            let in_front = if delta_x != 0 {
+                if delta_x > 0 { dx > 0. } else { dx < 0. }
+            } else if delta_y > 0 {
+                dy > 0.
+            } else {
+                dy < 0.
+            };
+
+            if !in_front {
+                continue;
+            }
+
+            let dist = if delta_x != 0 { dx.abs() } else { dy.abs() };
+            let perpendicular = if delta_x != 0 { dy.abs() } else { dx.abs() };
+            let effective_dist = dist + perpendicular;
+
+            if effective_dist < best_dist {
+                best_dist = effective_dist;
+                best_idx = idx;
+            }
+        }
+
+        // If no tile found in the desired direction, wrap to the opposite side.
+        if best_idx == current_idx {
+            let mut opposite_dist = f64::MAX;
+            for (idx, (pos, size)) in positions.iter().enumerate() {
+                if idx == current_idx {
+                    continue;
+                }
+
+                let center: Point<f64, Logical> = Point::from((
+                    pos.x + size.w / 2.,
+                    pos.y + size.h / 2.,
+                ));
+                let dx = center.x - current_center.x;
+                let dy = center.y - current_center.y;
+
+                let behind = if delta_x != 0 {
+                    if delta_x > 0 { dx < 0. } else { dx > 0. }
+                } else if delta_y > 0 {
+                    dy < 0.
+                } else {
+                    dy > 0.
+                };
+
+                if !behind {
+                    continue;
+                }
+
+                let dist = if delta_x != 0 { dx.abs() } else { dy.abs() };
+                if dist < opposite_dist {
+                    opposite_dist = dist;
+                    best_idx = idx;
+                }
+            }
+        }
+
+        // If still no candidate found, fall back to simple cyclic next/prev.
+        if best_idx == current_idx {
+            if (delta_x > 0) || (delta_y > 0) {
+                best_idx = (current_idx + 1) % overview_tiles.len();
+            } else {
+                best_idx = if current_idx == 0 {
+                    overview_tiles.len() - 1
+                } else {
+                    current_idx - 1
+                };
+            }
+        }
+
+        if best_idx != current_idx {
+            self.overview_focused_idx = best_idx;
+            if self.workspace_overview_open {
+                self.set_monitors_workspace_overview_state();
+            } else if self.window_overview_open {
+                self.set_monitors_window_overview_state();
+            }
+        }
+    }
+
+    pub fn overview_focus_left(&mut self) {
+        self.overview_navigate_focus(-1, 0);
+    }
+
+    pub fn overview_focus_right(&mut self) {
+        self.overview_navigate_focus(1, 0);
+    }
+
+    pub fn overview_focus_up(&mut self) {
+        self.overview_navigate_focus(0, -1);
+    }
+
+    pub fn overview_focus_down(&mut self) {
+        self.overview_navigate_focus(0, 1);
+    }
+
+    pub fn set_monitors_window_overview_state(&mut self) {
+        let monitors = match &mut self.monitor_set {
+            MonitorSet::Normal { monitors, .. } => monitors,
+            MonitorSet::NoOutputs { .. } => return,
+        };
+
+        for mon in monitors {
+            mon.window_overview_open = self.window_overview_open;
+            mon.set_window_overview_progress(self.window_overview_progress.as_ref());
+            mon.overview_excluded_windows = self.overview_excluded_windows.clone();
+            mon.show_floating_overview = self.show_floating_overview;
+            mon.overview_focused_idx = self.overview_focused_idx;
+        }
     }
 
     pub fn start_open_animation_for_window(&mut self, window: &W::Id) {
@@ -5003,6 +5570,11 @@ impl<W: LayoutElement> Layout<W> {
     pub fn is_overview_open(&self) -> bool {
         self.overview_open
     }
+
+    /// Returns true if any overview (original, workspace, or window) is open.
+    pub fn is_any_overview_open(&self) -> bool {
+        self.overview_open || self.workspace_overview_open || self.window_overview_open
+    }
 }
 
 impl<W: LayoutElement> Default for MonitorSet<W> {
@@ -5020,4 +5592,198 @@ fn compute_overview_zoom(options: &Options, overview_progress: Option<f64>) -> f
     } else {
         1.
     }
+}
+
+/// Positions and scale for workspace overview windows.
+pub type WorkspaceOverviewLayout = (Vec<(Point<f64, Logical>, Size<f64, Logical>)>, f64);
+
+/// Compute positions for windows in the workspace overview.
+///
+/// Uses a dynamic-scaling flow layout:
+/// - Computes initial scale from area ratio heuristic
+/// - Places windows left-to-right, top-to-bottom (order-preserving)
+/// - If windows don't fit, recursively shrinks scale by 0.9x
+/// - Centers the final layout on screen
+/// - For many windows (>6), sorts by area descending for better packing
+///
+/// Returns (positions, scale_factor).
+pub fn compute_workspace_overview_positions(
+    tile_sizes: &[Size<f64, Logical>],
+    view_size: Size<f64, Logical>,
+    gap: f64,
+    max_scale: f64,
+    min_scale: f64,
+) -> WorkspaceOverviewLayout {
+    if tile_sizes.is_empty() {
+        return (vec![], 1.);
+    }
+
+    let usable_w = view_size.w - gap;
+    let usable_h = view_size.h - gap;
+
+    // Sort by area descending when many windows for better packing (small windows fill gaps).
+    // Rendering uses tile ID matching, so sorting doesn't affect position stability.
+    let mut sorted: Vec<(usize, Size<f64, Logical>)> =
+        tile_sizes.iter().copied().enumerate().collect();
+    if sorted.len() > 6 {
+        sorted.sort_by(|a, b| {
+            let area_a = a.1.w * a.1.h;
+            let area_b = b.1.w * b.1.h;
+            area_b
+                .partial_cmp(&area_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
+    // Compute initial scale from area ratio heuristic.
+    let total_area: f64 = tile_sizes.iter().map(|s| s.w * s.h).sum();
+    let usable_area = usable_w * usable_h;
+    let area_scale = if total_area > 0. {
+        (usable_area / (total_area * 1.2)).sqrt()
+    } else {
+        1.
+    };
+    let initial_scale = area_scale.min(max_scale).max(min_scale);
+
+    // Try layout with recursive shrinking.
+    fn try_layout(
+        sorted: &[(usize, Size<f64, Logical>)],
+        tile_sizes: &[Size<f64, Logical>],
+        usable_w: f64,
+        usable_h: f64,
+        gap: f64,
+        scale: f64,
+        min_scale: f64,
+    ) -> Option<WorkspaceOverviewLayout> {
+        let mut positions = vec![(Point::from((0., 0.)), Size::from((0., 0.))); tile_sizes.len()];
+
+        // First pass: group windows into rows.
+        let mut rows: Vec<Vec<(usize, f64, f64)>> = Vec::new();
+        let mut current_row: Vec<(usize, f64, f64)> = Vec::new();
+        let mut row_w = 0_f64;
+
+        for &(idx, size) in sorted {
+            let target_w = size.w * scale;
+            let target_h = size.h * scale;
+
+            let needed = if current_row.is_empty() {
+                target_w
+            } else {
+                row_w + gap + target_w
+            };
+            if !current_row.is_empty() && needed > usable_w {
+                rows.push(std::mem::take(&mut current_row));
+                row_w = 0.;
+            }
+            if current_row.is_empty() {
+                row_w = target_w;
+            } else {
+                row_w += gap + target_w;
+            }
+            current_row.push((idx, target_w, target_h));
+        }
+        if !current_row.is_empty() {
+            rows.push(current_row);
+        }
+
+        // Check if it fits vertically.
+        let total_h: f64 = rows
+            .iter()
+            .map(|row| row.iter().map(|(_, _, h)| *h).fold(0_f64, f64::max))
+            .sum::<f64>()
+            + (rows.len() as f64 - 1.) * gap;
+
+        if total_h > usable_h {
+            let new_scale = scale * 0.9;
+            if new_scale >= min_scale {
+                return try_layout(
+                    sorted, tile_sizes, usable_w, usable_h, gap, new_scale, min_scale,
+                );
+            }
+        }
+
+        // Second pass: place windows, centering each row.
+        let mut cursor_y = 0_f64;
+        for row in &rows {
+            let row_max_h = row.iter().map(|(_, _, h)| *h).fold(0_f64, f64::max);
+            // Compute total row width including gaps between windows.
+            let total_row_w: f64 =
+                row.iter().map(|(_, w, _)| *w).sum::<f64>() + (row.len() as f64 - 1.) * gap;
+            // Center the row.
+            let mut cursor_x = (usable_w - total_row_w) / 2.;
+
+            for &(idx, target_w, target_h) in row {
+                positions[idx] = (
+                    Point::from((cursor_x, cursor_y)),
+                    Size::from((target_w, target_h)),
+                );
+                cursor_x += target_w + gap;
+            }
+            cursor_y += row_max_h + gap;
+        }
+
+        // Center the layout on screen.
+        // Compute bounding box of placed windows.
+        let mut min_x = f64::INFINITY;
+        let mut min_y = f64::INFINITY;
+        let mut max_x = 0_f64;
+        let mut max_y = 0_f64;
+        for (pos, size) in &positions {
+            if size.w > 0. && size.h > 0. {
+                min_x = min_x.min(pos.x);
+                min_y = min_y.min(pos.y);
+                max_x = max_x.max(pos.x + size.w);
+                max_y = max_y.max(pos.y + size.h);
+            }
+        }
+        if min_x.is_finite() {
+            let bbox_w = max_x - min_x;
+            let bbox_h = max_y - min_y;
+            let offset_x = (usable_w - bbox_w) / 2. - min_x + gap;
+            let offset_y = (usable_h - bbox_h) / 2. - min_y + gap;
+            for (pos, _) in &mut positions {
+                if pos.x.is_finite() {
+                    pos.x += offset_x;
+                    pos.y += offset_y;
+                }
+            }
+        }
+
+        Some((positions, scale))
+    }
+
+    let (positions, scale) = try_layout(
+        &sorted,
+        tile_sizes,
+        usable_w,
+        usable_h,
+        gap,
+        initial_scale,
+        min_scale,
+    )
+    .unwrap_or_else(|| {
+        // Fallback: place at min_scale without centering.
+        let mut positions = vec![(Point::from((0., 0.)), Size::from((0., 0.))); tile_sizes.len()];
+        let mut cursor_x = gap;
+        let mut cursor_y = gap;
+        let mut row_max_h = 0_f64;
+        for &(idx, size) in &sorted {
+            let target_w = size.w * min_scale;
+            let target_h = size.h * min_scale;
+            if cursor_x > gap && cursor_x + target_w > view_size.w - gap {
+                cursor_x = gap;
+                cursor_y += row_max_h + gap;
+                row_max_h = 0.;
+            }
+            positions[idx] = (
+                Point::from((cursor_x, cursor_y)),
+                Size::from((target_w, target_h)),
+            );
+            cursor_x += target_w + gap;
+            row_max_h = row_max_h.max(target_h);
+        }
+        (positions, min_scale)
+    });
+
+    (positions, scale)
 }

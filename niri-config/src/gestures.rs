@@ -1,3 +1,5 @@
+use knuffel::errors::DecodeError;
+
 use crate::utils::MergeWith;
 use crate::FloatOrInt;
 
@@ -97,16 +99,57 @@ impl MergeWith<DndEdgeWorkspaceSwitchPart> for DndEdgeWorkspaceSwitch {
     }
 }
 
+#[derive(knuffel::DecodeScalar, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum HotCornerAction {
+    #[default]
+    Overview,
+    WorkspaceOverview,
+    WindowOverview,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HotCornerEntry {
+    pub action: HotCornerAction,
+}
+
+impl Default for HotCornerEntry {
+    fn default() -> Self {
+        Self { action: HotCornerAction::Overview }
+    }
+}
+
+impl<S: knuffel::traits::ErrorSpan> knuffel::Decode<S> for HotCornerEntry {
+    fn decode_node(
+        node: &knuffel::ast::SpannedNode<S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        let action = match node.arguments.first() {
+            Some(arg) => <HotCornerAction as knuffel::DecodeScalar<S>>::raw_decode(&arg.literal, ctx)?,
+            None => HotCornerAction::Overview,
+        };
+
+        for arg in node.arguments.iter().skip(1) {
+            ctx.emit_error(DecodeError::unexpected(
+                &arg.literal,
+                "argument",
+                "only one argument allowed",
+            ));
+        }
+
+        Ok(Self { action })
+    }
+}
+
 #[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq)]
 pub struct HotCorners {
     #[knuffel(child)]
     pub off: bool,
     #[knuffel(child)]
-    pub top_left: bool,
+    pub top_left: Option<HotCornerEntry>,
     #[knuffel(child)]
-    pub top_right: bool,
+    pub top_right: Option<HotCornerEntry>,
     #[knuffel(child)]
-    pub bottom_left: bool,
+    pub bottom_left: Option<HotCornerEntry>,
     #[knuffel(child)]
-    pub bottom_right: bool,
+    pub bottom_right: Option<HotCornerEntry>,
 }

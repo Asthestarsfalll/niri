@@ -365,6 +365,12 @@ pub enum Action {
     ToggleOverview,
     OpenOverview,
     CloseOverview,
+    ToggleWorkspaceOverview(
+        #[knuffel(property(name = "show-floating"), default = false)] bool,
+    ),
+    ToggleWindowOverview(
+        #[knuffel(property(name = "show-floating"), default = false)] bool,
+    ),
     #[knuffel(skip)]
     ToggleWindowUrgent(u64),
     #[knuffel(skip)]
@@ -700,6 +706,12 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::ToggleOverview {} => Self::ToggleOverview,
             niri_ipc::Action::OpenOverview {} => Self::OpenOverview,
             niri_ipc::Action::CloseOverview {} => Self::CloseOverview,
+            niri_ipc::Action::ToggleWorkspaceOverview { show_floating } => {
+                Self::ToggleWorkspaceOverview(show_floating)
+            }
+            niri_ipc::Action::ToggleWindowOverview { show_floating } => {
+                Self::ToggleWindowOverview(show_floating)
+            }
             niri_ipc::Action::ToggleWindowUrgent { id } => Self::ToggleWindowUrgent(id),
             niri_ipc::Action::SetWindowUrgent { id } => Self::SetWindowUrgent(id),
             niri_ipc::Action::UnsetWindowUrgent { id } => Self::UnsetWindowUrgent(id),

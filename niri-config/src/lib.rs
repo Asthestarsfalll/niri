@@ -49,7 +49,7 @@ pub use crate::appearance::*;
 pub use crate::binds::*;
 pub use crate::debug::Debug;
 pub use crate::error::{ConfigIncludeError, ConfigParseResult};
-pub use crate::gestures::Gestures;
+pub use crate::gestures::{Gestures, HotCornerAction};
 pub use crate::input::{Input, ModKey, ScrollMethod, TrackLayout, WarpMouseToFocusMode, Xkb};
 pub use crate::layer_rule::LayerRule;
 pub use crate::layout::*;
@@ -83,6 +83,7 @@ pub struct Config {
     pub blur: Blur,
     pub gestures: Gestures,
     pub overview: Overview,
+    pub workspace_overview: WorkspaceOverview,
     pub environment: Environment,
     pub xwayland_satellite: XwaylandSatellite,
     pub window_rules: Vec<WindowRule>,
@@ -200,6 +201,7 @@ where
                 "blur" => m_merge!(blur),
                 "gestures" => m_merge!(gestures),
                 "overview" => m_merge!(overview),
+                "workspace-overview" => m_merge!(workspace_overview),
                 "xwayland-satellite" => m_merge!(xwayland_satellite),
                 "switch-events" => m_merge!(switch_events),
                 "debug" => m_merge!(debug),
@@ -1197,10 +1199,26 @@ mod tests {
                         hot_corners: Some(
                             HotCorners {
                                 off: true,
-                                top_left: true,
-                                top_right: true,
-                                bottom_left: true,
-                                bottom_right: true,
+                                top_left: Some(
+                                    HotCornerEntry {
+                                        action: Overview,
+                                    },
+                                ),
+                                top_right: Some(
+                                    HotCornerEntry {
+                                        action: Overview,
+                                    },
+                                ),
+                                bottom_left: Some(
+                                    HotCornerEntry {
+                                        action: Overview,
+                                    },
+                                ),
+                                bottom_right: Some(
+                                    HotCornerEntry {
+                                        action: Overview,
+                                    },
+                                ),
                             },
                         ),
                         layout: None,
@@ -1666,10 +1684,10 @@ mod tests {
                 },
                 hot_corners: HotCorners {
                     off: false,
-                    top_left: false,
-                    top_right: false,
-                    bottom_left: false,
-                    bottom_right: false,
+                    top_left: None,
+                    top_right: None,
+                    bottom_left: None,
+                    bottom_right: None,
                 },
             },
             overview: Overview {
@@ -1699,6 +1717,34 @@ mod tests {
                         a: 0.3137255,
                     },
                 },
+            },
+            workspace_overview: WorkspaceOverview {
+                max_scale: 0.95,
+                min_scale: 0.3,
+                gap: 16.0,
+                backdrop_color: Color {
+                    r: 0.15,
+                    g: 0.15,
+                    b: 0.15,
+                    a: 1.0,
+                },
+                focus_border_color: Color {
+                    r: 1.0,
+                    g: 0.7529412,
+                    b: 0.79607844,
+                    a: 1.0,
+                },
+                animation_duration: WorkspaceOverviewAnim(
+                    Animation {
+                        off: false,
+                        kind: Easing(
+                            EasingParams {
+                                duration_ms: 250,
+                                curve: EaseOutQuad,
+                            },
+                        ),
+                    },
+                ),
             },
             environment: Environment(
                 [
